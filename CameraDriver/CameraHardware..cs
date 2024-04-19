@@ -377,6 +377,10 @@ namespace ASCOM.RobertU3s1021.Camera
         private const int bayerOffsetY = 1;
         private const double exposureMin = 0.000041;
         private const double exposureMax = 10.0;
+        private const short gainMin = 1125;
+        private const short gainMax = 5000;
+        private const SensorType sensorType = SensorType.RGGB;
+        private const string sensorName = "SHARP RJ5DY1BA0LT";
 
         static private int cameraNumX = ccdWidth; // Initialise variables to hold values required for functionality
         static private int cameraNumY = ccdHeight;
