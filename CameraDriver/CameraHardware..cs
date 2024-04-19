@@ -381,6 +381,8 @@ namespace ASCOM.RobertU3s1021.Camera
         private const short gainMax = 5000;
         private const SensorType sensorType = SensorType.RGGB;
         private const string sensorName = "SHARP RJ5DY1BA0LT";
+        private const int maxADU = 65535;
+        private const int maxBIN = 4;
 
         static private int cameraNumX = ccdWidth; // Initialise variables to hold values required for functionality
         static private int cameraNumY = ccdHeight;
@@ -409,8 +411,9 @@ namespace ASCOM.RobertU3s1021.Camera
         {
             get
             {
-                LogMessage("BayerOffsetX Get", "Not implemented");
-                throw new PropertyNotImplementedException("BayerOffsetX", false);
+                LogMessage("BayerOffsetX Get", bayerOffsetX.ToString());
+                // throw new PropertyNotImplementedException("BayerOffsetX", false);
+                return bayerOffsetX;
             }
         }
 
@@ -422,8 +425,9 @@ namespace ASCOM.RobertU3s1021.Camera
         {
             get
             {
-                LogMessage("BayerOffsetY Get", "Not implemented");
-                throw new PropertyNotImplementedException("BayerOffsetX", true);
+                LogMessage("BayerOffsetY Get",bayerOffsetY.ToString());
+                // throw new PropertyNotImplementedException("BayerOffsetX", true);
+                return bayerOffsetY;
             }
         }
 
@@ -668,8 +672,9 @@ namespace ASCOM.RobertU3s1021.Camera
         {
             get
             {
-                LogMessage("ExposureMax Get", "Not implemented");
-                throw new PropertyNotImplementedException("ExposureMax", false);
+                LogMessage("ExposureMax Get", exposureMax.ToString());
+                // throw new PropertyNotImplementedException("ExposureMax", false);
+                return exposureMax;
             }
         }
 
@@ -681,8 +686,9 @@ namespace ASCOM.RobertU3s1021.Camera
         {
             get
             {
-                LogMessage("ExposureMin Get", "Not implemented");
-                throw new PropertyNotImplementedException("ExposureMin", false);
+                LogMessage("ExposureMin Get", exposureMin.ToString());
+                // throw new PropertyNotImplementedException("ExposureMin", false);
+                return exposureMin;
             }
         }
 
@@ -760,8 +766,9 @@ namespace ASCOM.RobertU3s1021.Camera
         {
             get
             {
-                LogMessage("GainMax Get", "Not implemented");
-                throw new PropertyNotImplementedException("GainMax", false);
+                LogMessage("GainMax Get", gainMax.ToString());
+                // throw new PropertyNotImplementedException("GainMax", false);
+                return gainMax;
             }
         }
 
@@ -773,8 +780,9 @@ namespace ASCOM.RobertU3s1021.Camera
         {
             get
             {
-                LogMessage("GainMin Get", "Not implemented");
-                throw new PropertyNotImplementedException("GainMin", true);
+                LogMessage("GainMin Get", gainMin.ToString());
+                // throw new PropertyNotImplementedException("GainMin", true);
+                return gainMin;
             }
         }
 
@@ -939,8 +947,8 @@ namespace ASCOM.RobertU3s1021.Camera
         {
             get
             {
-                LogMessage("MaxADU Get", "20000");
-                return 20000;
+                LogMessage("MaxADU Get", maxADU.ToString());
+                return maxADU;
             }
         }
 
@@ -952,8 +960,8 @@ namespace ASCOM.RobertU3s1021.Camera
         {
             get
             {
-                LogMessage("MaxBinX Get", "1");
-                return 1;
+                LogMessage("MaxBinX Get", maxBIN.ToString());
+                return maxBIN;
             }
         }
 
@@ -965,8 +973,8 @@ namespace ASCOM.RobertU3s1021.Camera
         {
             get
             {
-                LogMessage("MaxBinY Get", "1");
-                return 1;
+                LogMessage("MaxBinY Get", maxBIN.ToString());
+                return maxBIN;
             }
         }
 
@@ -1157,8 +1165,9 @@ namespace ASCOM.RobertU3s1021.Camera
         {
             get
             {
-                LogMessage("SensorName Get", "Not implemented");
-                throw new PropertyNotImplementedException("SensorName", false);
+                LogMessage("SensorName Get", sensorName);
+                // throw new PropertyNotImplementedException("SensorName", false);
+                return sensorName;
             }
         }
 
@@ -1170,8 +1179,9 @@ namespace ASCOM.RobertU3s1021.Camera
         {
             get
             {
-                LogMessage("SensorType Get", "Not implemented");
-                throw new PropertyNotImplementedException("SensorType", false);
+                LogMessage("SensorType Get", "RGGB(GBRG actually)");
+                // throw new PropertyNotImplementedException("SensorType", false);
+                return sensorType;
             }
         }
 
