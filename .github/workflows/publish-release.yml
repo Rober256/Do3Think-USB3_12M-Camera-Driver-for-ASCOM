@@ -1,0 +1,26 @@
+name: Publish driver release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Create GitHub Release and upload installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          "dist/RobertDo3Think_ASCOM_Camera_Driver_Setup_1.1.2.exe"
+          --repo "${GITHUB_REPOSITORY}"
+          --title "Robert Do3Think ASCOM Camera Driver ${GITHUB_REF_NAME}"
+          --generate-notes
