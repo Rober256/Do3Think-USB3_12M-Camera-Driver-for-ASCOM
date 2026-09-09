@@ -164,4 +164,11 @@ dist/                  本地发布包和 Release 附件
 
 ## 版本与许可证
 
-当前公开安装包版本为 `v1.1.2`。项目依赖 ASCOM Platform 和 Do3Think DVP SDK；使用和再分发时请同时遵守相应组件的许可证及厂商条款。
+当前公开安装包包括两个版本：
+
+- [v1.1.1 保守兼容版](https://github.com/Rober256/Do3Think-USB3_12M-Camera-Driver-for-ASCOM/releases/tag/v1.1.1)：保留较早的采集恢复路径，适合作为已经验证过的系统的稳定回退版本。
+- [v1.1.2 采集/恢复调整版](https://github.com/Rober256/Do3Think-USB3_12M-Camera-Driver-for-ASCOM/releases/tag/v1.1.2)：调整了采集线程、帧错误处理、曝光/增益参数应用和相机重连流程。
+
+两个版本的安装包依赖文件相同，差异主要在主驱动程序。由于目前没有覆盖所有相机和采集软件组合的自动化实机回归测试，不能把 `v1.1.1` 的“更稳定”理解为对所有环境的绝对保证；如果当前系统使用 `v1.1.1` 正常，建议保留它作为回退包，再单独验证 `v1.1.2`。
+
+项目依赖 ASCOM Platform 和 Do3Think DVP SDK；使用和再分发时请同时遵守相应组件的许可证及厂商条款。

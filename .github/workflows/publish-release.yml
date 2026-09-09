@@ -18,9 +18,19 @@ jobs:
       - name: Create GitHub Release and upload installer
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${GITHUB_REF_NAME}"
-          "dist/RobertDo3Think_ASCOM_Camera_Driver_Setup_1.1.2.exe"
-          --repo "${GITHUB_REPOSITORY}"
-          --title "Robert Do3Think ASCOM Camera Driver ${GITHUB_REF_NAME}"
-          --generate-notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          asset="dist/RobertDo3Think_ASCOM_Camera_Driver_Setup_${version}.exe"
+          test -f "$asset"
+
+          if [ -f "release-notes/${GITHUB_REF_NAME}.md" ]; then
+            gh release create "$GITHUB_REF_NAME" "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Robert Do3Think ASCOM Camera Driver ${GITHUB_REF_NAME}" \
+              --notes-file "release-notes/${GITHUB_REF_NAME}.md"
+          else
+            gh release create "$GITHUB_REF_NAME" "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Robert Do3Think ASCOM Camera Driver ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
