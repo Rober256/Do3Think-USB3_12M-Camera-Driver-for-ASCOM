@@ -28,6 +28,8 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             // Place any validation constraint checks here and update the state variables with results from the dialogue
 
             tl.Enabled = chkTrace.Checked;
+            DaytimeSmoothCorrection.Enabled = chkDaytimeSmoothCorrection.Checked;
+            DaytimeSmoothCorrection.MaximumExposureSeconds = (double)numericDaytimeMaximumExposureMs.Value / 1000.0;
 
             // Update the COM port variable if one has been selected
             if (comboBoxComPort.SelectedItem is null) // No COM port selected
@@ -72,6 +74,13 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
 
             // Set the trace checkbox
             chkTrace.Checked = tl.Enabled;
+            chkDaytimeSmoothCorrection.Checked = DaytimeSmoothCorrection.Enabled;
+            decimal maximumExposureMilliseconds = (decimal)(DaytimeSmoothCorrection.MaximumExposureSeconds * 1000.0);
+            if (maximumExposureMilliseconds < numericDaytimeMaximumExposureMs.Minimum)
+                maximumExposureMilliseconds = numericDaytimeMaximumExposureMs.Minimum;
+            if (maximumExposureMilliseconds > numericDaytimeMaximumExposureMs.Maximum)
+                maximumExposureMilliseconds = numericDaytimeMaximumExposureMs.Maximum;
+            numericDaytimeMaximumExposureMs.Value = maximumExposureMilliseconds;
 
             // set the list of COM ports to those that are currently available
             comboBoxComPort.Items.Clear(); // Clear any existing entries

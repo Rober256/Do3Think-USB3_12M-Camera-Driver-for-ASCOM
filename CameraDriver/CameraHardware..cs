@@ -40,12 +40,14 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         private static string DriverProgId = ""; // ASCOM DeviceID (COM ProgID) for this driver, the value is set by the driver's class initialiser.
         private static string DriverDescription = "Roberts U3s1021 CamDriver"; // The value is set by the driver's class initialiser.
         internal static string comPort; // COM port name (if required)
-        private static bool connectedState; // Local server's connected state
+        private static volatile bool connectedState; // Logical client connection state; SDK recovery may temporarily replace the native handle.
         private static bool runOnce = false; // Flag to enable "one-off" activities only to run once.
         internal static Util utilities; // ASCOM Utilities object for use as required
         internal static AstroUtils astroUtilities; // ASCOM AstroUtilities object for use as required
         internal static TraceLogger tl; // Local server's trace logger object for diagnostic log with information that you specify
         internal static uint handle = 0; //DVP SDK 需要定义相机句柄表示连接的相机，如果是只连接一个相机，应该是默认为0即可
+        private static string cameraFriendlyName = string.Empty;
+        private static string cameraSerialNumber = string.Empty;
         internal const string driverversion = "0.1";
         private static double LastDuration = -1.0;
         /// <summary>
@@ -153,7 +155,7 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         public static string Action(string actionName, string actionParameters)
         {
             LogMessage("Action", $"Action {actionName}, parameters {actionParameters} is not implemented");
-            throw new ActionNotImplementedException("Action " + actionName + " is not implemented by this driver");
+            throw new MethodNotImplementedException("Action");
         }
 
         /// <summary>
@@ -283,23 +285,74 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
                 {
                     // Connect Camera
                     LogMessage("Connected Set", $"Connecting to port {comPort}");
-                    uint camNum = 0;
-                    DVPCamera.dvpRefresh(ref camNum);
-                    DVPCamera.dvpOpen(0, dvpOpenMode.OPEN_NORMAL, ref CameraHardware.handle);
-                    DVPCamera.dvpIsOnline(CameraHardware.handle, ref connectedState);
-                    LogMessage("Connected Set", "Connecting to device");
-                    CameraHardware.Connected = connectedState;
-                    connectedState = true;
+                    try
+                    {
+                        CameraHardware.handle = OpenPreferredCamera("initial connection");
+                        bool online = false;
+                        CheckStatus(DVPCamera.dvpIsOnline(CameraHardware.handle, ref online), "dvpIsOnline");
+                        if (!online) throw new NotConnectedException("The DVP camera is not online.");
+
+                        lock (cameraLock)
+                        {
+                            ResetCapturedFrame();
+                            captureFailureMessage = string.Empty;
+                            captureRecoveryInProgress = false;
+                            requestedCaptureDuration = ExposureMin;
+                            ConfigureManualExposure(requestedCaptureDuration);
+                            ConfigureAnalogGain(requestedGain);
+                            configuredCaptureRequestDuration = requestedCaptureDuration;
+                            appliedCaptureDuration = CameraHardware.LastDuration;
+                            appliedGain = requestedGain;
+                            StartFreeRunStream();
+                            captureSignature = BuildCaptureSignature();
+                            StartCaptureThread();
+                            connectedState = true;
+                        }
+                        LogMessage("Connected Set", "Connected to device");
+                    }
+                    catch
+                    {
+                        captureThreadStop = true;
+                        connectedState = false;
+                        if (IsValidHandle(CameraHardware.handle))
+                        {
+                            try { DVPCamera.dvpStop(CameraHardware.handle); } catch { }
+                            try { DVPCamera.dvpClose(CameraHardware.handle); } catch { }
+                        }
+                        CameraHardware.handle = 0;
+                        throw;
+                    }
                 }
                 else
                 {
                     // Disconnect Camera
                     LogMessage("Disconnected Set", $"Disconnecting from port {comPort}");
-                    DVPCamera.dvpClose(CameraHardware.handle);
+                    // Reject new client work immediately. The capture thread may currently be
+                    // between dvpClose and dvpOpen as part of an internal recovery.
                     connectedState = false;
+                    StopStreamIfStarted();
+                    dvpStatus closeStatus = DVPCamera.dvpClose(CameraHardware.handle);
+                    if (closeStatus != dvpStatus.DVP_STATUS_OK)
+                    {
+                        LogMessage("dvpClose", $"Close returned {closeStatus}; clearing the local handle so a later connection can start cleanly.");
+                    }
+                    CameraHardware.handle = 0;
                     LogMessage("Connected Set", "Disconnecting from device");
-                    CameraHardware.Connected = false;
-                    connectedState = false;
+                    lock (cameraLock)
+                    {
+                        connectedState = false;
+                        cameraImageReady = false;
+                        cameraImageDownloaded = false;
+                        cameraState = CameraStates.cameraIdle;
+                        requestedCaptureDuration = 0.0;
+                        configuredCaptureRequestDuration = 0.0;
+                        appliedCaptureDuration = 0.0;
+                        appliedGain = 0;
+                        captureStartupTimeoutPending = false;
+                        captureRecoveryInProgress = false;
+                        captureFailureMessage = string.Empty;
+                        ResetCapturedFrame();
+                    }
                 }
             }
         }
@@ -379,6 +432,16 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         private const int ccdWidth = 4088; // Constants to define the CCD pixel dimensions
         private const int ccdHeight = 3072;
         private const double pixelSize = 3.10; // Constant for the pixel physical dimension
+        private const double HardwareExposureResolution = 0.000041;
+        private const double HardwareMinExposureDuration = HardwareExposureResolution;
+        private const double AdvertisedMaxExposureDuration = 10.0;
+        private const double HardwareMaxExposureDuration = 9.999982;
+        private const int SdkFrameQueueSize = 2;
+        private const short MinimumGain = 90;
+        private const short MaximumGain = 400;
+        private const double AnalogGainScale = 80.0;
+        private const int MaximumFullReopenAttempts = 3;
+        private const int RecoveryRetryDelayMilliseconds = 2000;
 
         static private int cameraNumX = ccdWidth; // Initialise variables to hold values required for functionality
         static private int cameraNumY = ccdHeight;
@@ -387,8 +450,34 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         static private DateTime exposureStart = DateTime.MinValue;
         static private double cameraLastExposureDuration = 0.0;
         static private bool cameraImageReady = false;
+        static private bool cameraImageDownloaded = false;
+        static private CameraStates cameraState = CameraStates.cameraIdle;
         static private int[,] cameraImageArray;
+        static private int[,] captureImageArray;
         static private object[,] cameraImageArrayVariant;
+        static private byte[] frameCopyBuffer8;
+        static private short[] frameCopyBuffer16;
+        static private bool capturedFrameAvailable = false;
+        static private double capturedFrameDuration = 0.0;
+        static private DateTime capturedFrameStartTime = DateTime.MinValue;
+        static private DateTime capturedFrameArrivalTime = DateTime.MinValue;
+        static private short capturedFrameGain = 0;
+        static private long capturedFrameVersion = 0;
+        static private long deliveredFrameVersion = 0;
+        static private string captureSignature = string.Empty;
+        static private volatile bool captureRecoveryInProgress = false;
+        static private volatile bool captureThreadStop = false;
+        static private System.Threading.Thread captureThread;
+        static private readonly object cameraLock = new object();
+        static private double requestedCaptureDuration = 0.0;
+        static private double configuredCaptureRequestDuration = 0.0;
+        static private double appliedCaptureDuration = 0.0;
+        static private short requestedGain = MinimumGain;
+        static private short appliedGain = 0;
+        static private bool captureStartupTimeoutPending = false;
+        static private string captureFailureMessage = string.Empty;
+        private const double FrameReadoutMarginMilliseconds = 5000.0;
+        private const double MinimumFrameTimeoutMilliseconds = 5000.0;
 
         /// <summary>
         /// Aborts the current exposure, if any, and returns the camera to Idle state.
@@ -482,8 +571,11 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                LogMessage("CameraState Get", CameraStates.cameraIdle.ToString());
-                return CameraStates.cameraIdle;
+                lock (cameraLock)
+                {
+                    LogMessage("CameraState Get", cameraState.ToString());
+                    return cameraState;
+                }
             }
         }
 
@@ -609,8 +701,8 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                LogMessage("CanStopExposure Get", true.ToString());
-                return true;
+                LogMessage("CanStopExposure Get", false.ToString());
+                return false;
             }
         }
 
@@ -666,11 +758,10 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                LogMessage("ExposureMax Get", "10.0");
-                return 10.0;
+                LogMessage("ExposureMax Get", AdvertisedMaxExposureDuration.ToString());
+                return AdvertisedMaxExposureDuration;
             }
         }
-
         /// <summary>
         /// Minimum exposure time
         /// </summary>
@@ -679,8 +770,8 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                LogMessage("ExposureMin Get", "0.000041");
-                return 0.000041;
+                LogMessage("ExposureMin Get", HardwareMinExposureDuration.ToString());
+                return HardwareMinExposureDuration;
             }
         }
 
@@ -692,8 +783,8 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                LogMessage("ExposureResolution Get", "Not implemented");
-                throw new PropertyNotImplementedException("ExposureResolution", false);
+                LogMessage("ExposureResolution Get", HardwareExposureResolution.ToString());
+                return HardwareExposureResolution;
             }
         }
 
@@ -741,28 +832,29 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             get
             {
                 CheckConnected("Gain Get");
-                float AnalogGain = 0;
-                DVPCamera.dvpGetAnalogGain(CameraHardware.handle, ref AnalogGain);
-                if (AnalogGain > 5.000 || AnalogGain < 1.125) throw new InvalidValueException("Gain", (AnalogGain * 80).ToString(), "90", "400"); 
-                LogMessage("Gain Get", (AnalogGain * 80).ToString());
-                return (short)(AnalogGain * 80);
+                lock (cameraLock)
+                {
+                    // Return the accepted target value. Only the capture thread is allowed to
+                    // touch the SDK while streaming or recovering the native camera handle.
+                    LogMessage("Gain Get", requestedGain.ToString());
+                    return requestedGain;
+                }
             }
             set
             {
-
                 LogMessage("Gain Set", value.ToString());
                 CheckConnected("Gain Set");
-                double AnalogGain = value / 80;
-                if (value < 90)
+                if (value < MinimumGain || value > MaximumGain)
                 {
-                    AnalogGain = 1.125;
+                    throw new InvalidValueException("Gain", value.ToString(), MinimumGain.ToString(), MaximumGain.ToString());
+                }
 
-                }
-                else if (value > 400)
+                lock (cameraLock)
                 {
-                    AnalogGain = 5.000;
+                    if (!connectedState) throw new NotConnectedException("Gain Set");
+                    requestedGain = value;
+                    System.Threading.Monitor.PulseAll(cameraLock);
                 }
-                DVPCamera.dvpSetAnalogGain(CameraHardware.handle, (float)(AnalogGain));
             }
         }
 
@@ -774,8 +866,8 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                LogMessage("GainMax Get","400");
-                return 400;
+                LogMessage("GainMax Get", MaximumGain.ToString());
+                return MaximumGain;
             }
         }
 
@@ -787,8 +879,8 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                LogMessage("GainMin Get", "90");
-                return 90;
+                LogMessage("GainMin Get", MinimumGain.ToString());
+                return MinimumGain;
             }
         }
 
@@ -801,7 +893,7 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             get
             {
                 LogMessage("Gains Get", "Not implemented");
-                throw new PropertyNotImplementedException("Gains", true);
+                throw new PropertyNotImplementedException("Gains", false);
             }
         }
 
@@ -841,55 +933,11 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                if (!cameraImageReady)
+                lock (cameraLock)
                 {
-                    LogMessage("ImageArray Get", "Throwing InvalidOperationException because of a call to ImageArray before the first image has been taken!");
-                    throw new ASCOM.InvalidOperationException("Call to ImageArray before the first image has been taken!");
-                }
-                cameraImageArray = new int[cameraNumX, cameraNumY];
-                if (!CameraHardware.IsValidHandle(CameraHardware.handle))
-                {
-                    CameraHardware.SetupDialog();
-                }
-                dvpFrame refRaw = new dvpFrame();
-                IntPtr rawPtr = new IntPtr();
-                var status = DVPCamera.dvpGetFrame(CameraHardware.handle, ref refRaw, ref rawPtr, 2000);
-                byte[] data = new byte[refRaw.uBytes];
-                Marshal.Copy(rawPtr, data, 0, data.Length);
-                int index = 0;
-                switch (refRaw.bits)
-                {
-                    // todo: speedup and decreace redundency
-                    case dvpBits.BITS_12:
-                        for (int y = 0; y < refRaw.iHeight; y++)
-                        {
-                            for (int x = 0; x < refRaw.iWidth; x++)
-                            {
-                                cameraImageArray[x, y] = BitConverter.ToUInt16(data, index * 2);
-                                index++;
-                            }
-                        }
-                        break;
-                    case dvpBits.BITS_8:
-                        for (int y = 0; y < refRaw.iHeight; y++)
-                        {
-                            for (int x = 0; x < refRaw.iWidth; x++)
-                            {
-                                cameraImageArray[x, y] = data[index];
-                                index++;
-                            }
-                        }
-                        break;
-                    default: break;
-                }
-                //switch mode by raw_bits_depth
-                if (status == dvpStatus.DVP_STATUS_OK)
-                {
-                    DVPCamera.dvpStop(CameraHardware.handle);
+                    EnsureImageDownloaded();
                     return cameraImageArray;
                 }
-                throw new DriverException("CameraStateError");
-                
             }
         }
 
@@ -901,21 +949,25 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                if (!cameraImageReady)
+                lock (cameraLock)
                 {
-                    LogMessage("ImageArrayVariant Get", "Throwing InvalidOperationException because of a call to ImageArrayVariant before the first image has been taken!");
-                    throw new ASCOM.InvalidOperationException("Call to ImageArrayVariant before the first image has been taken!");
-                }
-                cameraImageArrayVariant = new object[cameraNumX, cameraNumY];
-                for (int i = 0; i < cameraImageArray.GetLength(1); i++)
-                {
-                    for (int j = 0; j < cameraImageArray.GetLength(0); j++)
+                    EnsureImageDownloaded();
+                    if (cameraImageArrayVariant != null)
                     {
-                        cameraImageArrayVariant[j, i] = cameraImageArray[j, i];
+                        return cameraImageArrayVariant;
                     }
 
+                    cameraImageArrayVariant = new object[cameraImageArray.GetLength(0), cameraImageArray.GetLength(1)];
+                    for (int y = 0; y < cameraImageArray.GetLength(1); y++)
+                    {
+                        for (int x = 0; x < cameraImageArray.GetLength(0); x++)
+                        {
+                            cameraImageArrayVariant[x, y] = cameraImageArray[x, y];
+                        }
+
+                    }
+                    return cameraImageArrayVariant;
                 }
-                return cameraImageArrayVariant;
             }
         }
 
@@ -927,8 +979,15 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                LogMessage("ImageReady Get", cameraImageReady.ToString());
-                return cameraImageReady;
+                lock (cameraLock)
+                {
+                    LogMessage("ImageReady Get", cameraImageReady.ToString());
+                    if (cameraState == CameraStates.cameraError && !string.IsNullOrEmpty(captureFailureMessage))
+                    {
+                        throw new DriverException($"Camera capture failed: {captureFailureMessage}");
+                    }
+                    return cameraImageReady;
+                }
             }
         }
 
@@ -1006,8 +1065,8 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                LogMessage("MaxBinX Get", "4");
-                return 4;
+                LogMessage("MaxBinX Get", "1");
+                return 1;
             }
         }
 
@@ -1019,8 +1078,8 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                LogMessage("MaxBinY Get", "4");
-                return 4;
+                LogMessage("MaxBinY Get", "1");
+                return 1;
             }
         }
 
@@ -1037,7 +1096,11 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             }
             set
             {
+                if (value <= 0) throw new InvalidValueException("NumX", value.ToString(), "1 upwards");
+                if (cameraStartX + value > ccdWidth) throw new InvalidValueException("NumX", value.ToString(), (ccdWidth - cameraStartX).ToString());
                 cameraNumX = value;
+                cameraImageReady = false;
+                cameraImageDownloaded = false;
                 LogMessage("NumX set", value.ToString());
             }
         }
@@ -1055,7 +1118,11 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             }
             set
             {
+                if (value <= 0) throw new InvalidValueException("NumY", value.ToString(), "1 upwards");
+                if (cameraStartY + value > ccdHeight) throw new InvalidValueException("NumY", value.ToString(), (ccdHeight - cameraStartY).ToString());
                 cameraNumY = value;
+                cameraImageReady = false;
+                cameraImageDownloaded = false;
                 LogMessage("NumY set", value.ToString());
             }
         }
@@ -1103,7 +1170,7 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             get
             {
                 LogMessage("OffsetMin Get", "Not implemented");
-                throw new PropertyNotImplementedException("OffsetMin", true);
+                throw new PropertyNotImplementedException("OffsetMin", false);
             }
         }
 
@@ -1116,7 +1183,7 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             get
             {
                 LogMessage("Offsets Get", "Not implemented");
-                throw new PropertyNotImplementedException("Offsets", true);
+                throw new PropertyNotImplementedException("Offsets", false);
             }
         }
 
@@ -1180,13 +1247,16 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                LogMessage("ReadoutMode Get", "Not implemented");
-                throw new PropertyNotImplementedException("ReadoutMode", false);
+                LogMessage("ReadoutMode Get", "0 (RAW12)");
+                return 0;
             }
             set
             {
-                LogMessage("ReadoutMode Set", "Not implemented");
-                throw new PropertyNotImplementedException("ReadoutMode", true);
+                if (value != 0)
+                {
+                    throw new InvalidValueException("ReadoutMode", value.ToString(), "0");
+                }
+                LogMessage("ReadoutMode Set", "0 (RAW12)");
             }
         }
 
@@ -1198,8 +1268,8 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                LogMessage("ReadoutModes Get", "Not implemented");
-                throw new PropertyNotImplementedException("ReadoutModes", false);
+                LogMessage("ReadoutModes Get", "Returning RAW12");
+                return new ArrayList { "RAW12" };
             }
         }
 
@@ -1254,24 +1324,83 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         /// <param name="Light"><c>true</c> for light frame, <c>false</c> for dark frame (ignored if no shutter)</param>
         static internal void StartExposure(double Duration, bool Light)
         {
-            if (Duration < 0.0) throw new InvalidValueException("StartExposure", Duration.ToString(), "0.0 upwards");
-            if (cameraNumX > ccdWidth) throw new InvalidValueException("StartExposure", cameraNumX.ToString(), ccdWidth.ToString());
-            if (cameraNumY > ccdHeight) throw new InvalidValueException("StartExposure", cameraNumY.ToString(), ccdHeight.ToString());
-            if (cameraStartX > ccdWidth) throw new InvalidValueException("StartExposure", cameraStartX.ToString(), ccdWidth.ToString());
-            if (cameraStartY > ccdHeight) throw new InvalidValueException("StartExposure", cameraStartY.ToString(), ccdHeight.ToString());
-
-            exposureStart = DateTime.Now;
-            DVPCamera.dvpStart(CameraHardware.handle);
-            if (CameraHardware.LastDuration != Duration)
+            CheckConnected("StartExposure");
+            if (Duration < HardwareMinExposureDuration || Duration > AdvertisedMaxExposureDuration)
             {
-                DVPCamera.dvpSetExposure(CameraHardware.handle, Duration * 1000 * 1000);
-                CameraHardware.LastDuration = Duration;
+                throw new InvalidValueException("StartExposure", Duration.ToString(), HardwareMinExposureDuration.ToString(), AdvertisedMaxExposureDuration.ToString());
             }
-            System.Threading.Thread.Sleep((int)Duration * 1000);  // Sleep for the duration to simulate exposure 
-            LogMessage("StartExposure", Duration.ToString() + " " + Light.ToString());
-            cameraImageReady = true;
-        }
+            EnsureNativeHandleForExposure();
+            ValidateSubframe();
 
+            string captureSignature = BuildCaptureSignature();
+            bool restartCapture;
+
+            lock (cameraLock)
+            {
+                cameraImageReady = false;
+                cameraImageDownloaded = false;
+                cameraImageArrayVariant = null;
+                cameraState = CameraStates.cameraExposing;
+                bool captureThreadAlive = captureThread != null && captureThread.IsAlive;
+                // A live capture thread exclusively owns the DVP stream. In particular, do not
+                // let a client exposure call stop/start the SDK while that thread is recovering.
+                restartCapture = !captureThreadAlive || (CameraHardware.captureSignature != captureSignature && !captureRecoveryInProgress);
+                requestedCaptureDuration = Duration;
+                if (restartCapture) captureFailureMessage = string.Empty;
+            }
+
+            try
+            {
+                if (restartCapture)
+                {
+                    StopStreamIfStarted();
+                    lock (cameraLock)
+                    {
+                        ResetCapturedFrame();
+                        ConfigureManualExposure(Duration);
+                        configuredCaptureRequestDuration = Duration;
+                        appliedCaptureDuration = CameraHardware.LastDuration;
+                        StartFreeRunStream();
+                        CameraHardware.captureSignature = captureSignature;
+                        StartCaptureThread();
+                    }
+                }
+
+                lock (cameraLock)
+                {
+                    System.Threading.Monitor.PulseAll(cameraLock);
+                    if (capturedFrameAvailable && !IsCapturedFrameFreshLocked(Duration))
+                    {
+                        LogMessage("StartExposure", $"Discarding stale cached frame; age {(DateTime.UtcNow - capturedFrameArrivalTime).TotalSeconds:F2}s.");
+                        capturedFrameAvailable = false;
+                    }
+
+                    if (capturedFrameAvailable && ExposureDurationsMatch(configuredCaptureRequestDuration, Duration) && capturedFrameGain == requestedGain && appliedGain == requestedGain)
+                    {
+                        PublishCapturedFrameLocked(Duration, Light);
+                    }
+                    else
+                    {
+                        LogMessage("StartExposure", $"Duration {Duration}, Light {Light}, waiting for a frame captured with the requested exposure.");
+                    }
+                }
+            }
+            catch
+            {
+                lock (cameraLock)
+                {
+                    cameraImageReady = false;
+                    cameraImageDownloaded = false;
+                    cameraState = CameraStates.cameraIdle;
+                }
+                StopStreamIfStarted();
+                lock (cameraLock)
+                {
+                    ResetCapturedFrame();
+                }
+                throw;
+            }
+        }
         /// <summary>
         /// Sets the subframe start position for the X axis (0 based) and returns the current value.
         /// </summary>
@@ -1284,7 +1413,11 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             }
             set
             {
+                if (value < 0) throw new InvalidValueException("StartX", value.ToString(), "0 upwards");
+                if (value + cameraNumX > ccdWidth) throw new InvalidValueException("StartX", value.ToString(), (ccdWidth - cameraNumX).ToString());
                 cameraStartX = value;
+                cameraImageReady = false;
+                cameraImageDownloaded = false;
                 LogMessage("StartX Set", value.ToString());
             }
         }
@@ -1301,7 +1434,11 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             }
             set
             {
+                if (value < 0) throw new InvalidValueException("StartY", value.ToString(), "0 upwards");
+                if (value + cameraNumY > ccdHeight) throw new InvalidValueException("StartY", value.ToString(), (ccdHeight - cameraNumY).ToString());
                 cameraStartY = value;
+                cameraImageReady = false;
+                cameraImageDownloaded = false;
                 LogMessage("StartY set", value.ToString());
             }
         }
@@ -1311,16 +1448,9 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         /// </summary>
         static internal void StopExposure()
         {
-            LogMessage("StopExposure", "Using DVPstop");
-            if (connectedState)
-            {
-                dvpStatus status = DVPCamera.dvpStop(handle);
-                if (status != dvpStatus.DVP_STATUS_OK)
-                {
-                    throw new DriverException("Unknown Error");
-                }
-            }
-            else throw new NotConnectedException();
+            CheckConnected("StopExposure");
+            LogMessage("StopExposure", "Not implemented because the camera cannot preserve a partial exposure");
+            throw new MethodNotImplementedException("StopExposure");
         }
 
         /// <summary>
@@ -1352,8 +1482,11 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         {
             get
             {
-                return IsValidHandle(handle);
-                // TODO check that the driver hardware connection exists and is connected to the hardware
+                // A full recovery intentionally closes and replaces the native handle. Reporting
+                // that short interval as a disconnect makes ordinary client properties race with
+                // recovery. Physical failures are reflected by setting connectedState false when
+                // the reopen attempt actually fails.
+                return connectedState;
             }
         }
 
@@ -1369,9 +1502,882 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             }
         }
 
-        /// <summary>
-        /// Read the device configuration from the ASCOM Profile store
-        /// </summary>
+        private static void CheckStatus(dvpStatus status, string operation)
+        {
+            if (status != dvpStatus.DVP_STATUS_OK)
+            {
+                throw new DriverException($"{operation} failed: {status}");
+            }
+        }
+
+        private static uint OpenPreferredCamera(string context)
+        {
+            uint cameraCount = 0;
+            dvpStatus refreshStatus = DVPCamera.dvpRefresh(ref cameraCount);
+            bool identityKnown = !string.IsNullOrEmpty(cameraSerialNumber) || !string.IsNullOrEmpty(cameraFriendlyName);
+            if (refreshStatus != dvpStatus.DVP_STATUS_OK)
+            {
+                if (!identityKnown || string.IsNullOrEmpty(cameraFriendlyName))
+                {
+                    CheckStatus(refreshStatus, $"dvpRefresh during {context}");
+                }
+                LogMessage("Camera Open", $"dvpRefresh during {context} returned {refreshStatus}; trying the remembered friendly name because dvpOpenByName performs its own refresh.");
+                cameraCount = 0;
+            }
+            else if (cameraCount == 0)
+            {
+                if (!identityKnown || string.IsNullOrEmpty(cameraFriendlyName))
+                {
+                    throw new DriverException($"No DVP camera was found during {context}.");
+                }
+                LogMessage("Camera Open", $"dvpRefresh found no enumerable camera during {context}; trying remembered camera {cameraFriendlyName} to recover a possible half-open SDK session.");
+            }
+
+            bool selectedCameraFound = false;
+            uint selectedIndex = 0;
+            dvpCameraInfo selectedInfo = new dvpCameraInfo();
+
+            for (uint index = 0; index < cameraCount; index++)
+            {
+                dvpCameraInfo cameraInfo = new dvpCameraInfo();
+                dvpStatus enumStatus = DVPCamera.dvpEnum(index, ref cameraInfo);
+                if (enumStatus != dvpStatus.DVP_STATUS_OK)
+                {
+                    LogMessage("Camera Open", $"dvpEnum({index}) during {context} returned {enumStatus}.");
+                    continue;
+                }
+
+                bool identityMatches =
+                    (!string.IsNullOrEmpty(cameraSerialNumber) && string.Equals(cameraInfo.SerialNumber, cameraSerialNumber, StringComparison.Ordinal)) ||
+                    (!string.IsNullOrEmpty(cameraFriendlyName) && string.Equals(cameraInfo.FriendlyName, cameraFriendlyName, StringComparison.Ordinal));
+
+                if ((!identityKnown && index == 0) || identityMatches)
+                {
+                    selectedCameraFound = true;
+                    selectedIndex = index;
+                    selectedInfo = cameraInfo;
+                    break;
+                }
+            }
+
+            if (identityKnown && !selectedCameraFound && string.IsNullOrEmpty(cameraFriendlyName))
+            {
+                throw new DriverException($"The previously connected DVP camera ({cameraFriendlyName}, serial {cameraSerialNumber}) was not found during {context}.");
+            }
+
+            uint candidateHandle = 0;
+            dvpStatus openStatus;
+            string openOperation;
+            if (selectedCameraFound)
+            {
+                // Keep the normal and enumerable recovery path identical to the historically
+                // stable non-stack driver. Name-based open is reserved for a half-open SDK
+                // session that dvpRefresh can no longer enumerate.
+                openOperation = $"dvpOpen({selectedIndex})";
+                openStatus = DVPCamera.dvpOpen(selectedIndex, dvpOpenMode.OPEN_NORMAL, ref candidateHandle);
+            }
+            else if (!string.IsNullOrEmpty(cameraFriendlyName))
+            {
+                openOperation = $"dvpOpenByName({cameraFriendlyName})";
+                openStatus = DVPCamera.dvpOpenByName(cameraFriendlyName, dvpOpenMode.OPEN_NORMAL, ref candidateHandle);
+            }
+            else
+            {
+                openOperation = $"dvpOpen({selectedIndex})";
+                openStatus = DVPCamera.dvpOpen(selectedIndex, dvpOpenMode.OPEN_NORMAL, ref candidateHandle);
+            }
+
+            bool candidateValid = false;
+            dvpStatus validityStatus = DVPCamera.dvpIsValid(candidateHandle, ref candidateValid);
+            if ((validityStatus != dvpStatus.DVP_STATUS_OK || !candidateValid) && candidateHandle != 0)
+            {
+                // Some SDK/USB failures finish opening asynchronously. Give the returned handle
+                // one brief chance to become valid before deciding that the session is unusable.
+                System.Threading.Thread.Sleep(100);
+                validityStatus = DVPCamera.dvpIsValid(candidateHandle, ref candidateValid);
+            }
+
+            if (validityStatus == dvpStatus.DVP_STATUS_OK && candidateValid)
+            {
+                if (openStatus != dvpStatus.DVP_STATUS_OK)
+                {
+                    LogMessage("Camera Open", $"{openOperation} during {context} returned {openStatus}, but candidate handle {candidateHandle} is valid; adopting it.");
+                }
+                CacheCameraIdentity(candidateHandle, selectedCameraFound ? selectedInfo : new dvpCameraInfo());
+                return candidateHandle;
+            }
+
+            // A non-zero handle can represent a half-open SDK session even when dvpIsValid says
+            // false. Closing that exact candidate avoids the next open becoming DEVICE_IS_OPENED.
+            if (candidateHandle != 0)
+            {
+                dvpStatus cleanupStatus = DVPCamera.dvpClose(candidateHandle);
+                LogMessage("Camera Open", $"Rejected candidate handle {candidateHandle}; dvpIsValid returned {validityStatus}, valid={candidateValid}; cleanup dvpClose returned {cleanupStatus}.");
+            }
+
+            if (openStatus != dvpStatus.DVP_STATUS_OK)
+            {
+                throw new DriverException($"{openOperation} during {context} failed: {openStatus}");
+            }
+            throw new DriverException($"{openOperation} during {context} returned an invalid handle (dvpIsValid: {validityStatus}).");
+        }
+
+        private static void CacheCameraIdentity(uint cameraHandle, dvpCameraInfo enumeratedInfo)
+        {
+            dvpCameraInfo cameraInfo = enumeratedInfo;
+            if (string.IsNullOrEmpty(cameraInfo.FriendlyName) && string.IsNullOrEmpty(cameraInfo.SerialNumber))
+            {
+                dvpStatus infoStatus = DVPCamera.dvpGetCameraInfo(cameraHandle, ref cameraInfo);
+                if (infoStatus != dvpStatus.DVP_STATUS_OK)
+                {
+                    LogMessage("Camera Open", $"dvpGetCameraInfo returned {infoStatus}; retaining the previously remembered camera identity.");
+                }
+            }
+
+            if (!string.IsNullOrEmpty(cameraInfo.FriendlyName)) cameraFriendlyName = cameraInfo.FriendlyName;
+            if (!string.IsNullOrEmpty(cameraInfo.SerialNumber)) cameraSerialNumber = cameraInfo.SerialNumber;
+            LogMessage("Camera Open", $"Selected {cameraFriendlyName}, serial {cameraSerialNumber}, handle {cameraHandle}.");
+        }
+
+        private static void EnsureNativeHandleForExposure()
+        {
+            bool captureWorkerAlive;
+            lock (cameraLock)
+            {
+                captureWorkerAlive = captureThread != null && captureThread.IsAlive;
+            }
+
+            // While the worker is alive it exclusively owns recovery and may temporarily set the
+            // global handle to zero between close and open. The exposure request is simply queued.
+            if (captureWorkerAlive || IsValidHandle(CameraHardware.handle)) return;
+
+            LogMessage("StartExposure", "Capture worker is stopped and the native handle is invalid; attempting automatic camera reopen.");
+            Exception lastException = null;
+            for (int attempt = 1; attempt <= MaximumFullReopenAttempts; attempt++)
+            {
+                try
+                {
+                    CameraHardware.handle = 0;
+                    CameraHardware.handle = OpenPreferredCamera($"StartExposure recovery attempt {attempt}/{MaximumFullReopenAttempts}");
+                    lock (cameraLock)
+                    {
+                        captureFailureMessage = string.Empty;
+                        captureRecoveryInProgress = false;
+                    }
+                    LogMessage("StartExposure", $"Automatic camera reopen succeeded on attempt {attempt}.");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    CameraHardware.handle = 0;
+                    LogMessage("StartExposure", $"Automatic camera reopen attempt {attempt}/{MaximumFullReopenAttempts} failed: {ex.Message}");
+                    if (attempt < MaximumFullReopenAttempts)
+                    {
+                        System.Threading.Thread.Sleep(RecoveryRetryDelayMilliseconds);
+                    }
+                }
+            }
+
+            string failure = lastException == null ? "Unknown camera reopen failure." : lastException.Message;
+            lock (cameraLock)
+            {
+                captureFailureMessage = failure;
+                cameraImageReady = false;
+                cameraImageDownloaded = false;
+                cameraState = CameraStates.cameraError;
+            }
+            throw new DriverException($"The DVP camera handle was lost and automatic reopen failed: {failure}");
+        }
+
+        private static void LogOptionalStatus(dvpStatus status, string operation)
+        {
+            if (status != dvpStatus.DVP_STATUS_OK)
+            {
+                LogMessage(operation, $"Optional SDK call returned {status}");
+            }
+        }
+
+        private static void ValidateSubframe()
+        {
+            if (cameraNumX <= 0) throw new InvalidValueException("NumX", cameraNumX.ToString(), "1 upwards");
+            if (cameraNumY <= 0) throw new InvalidValueException("NumY", cameraNumY.ToString(), "1 upwards");
+            if (cameraStartX < 0) throw new InvalidValueException("StartX", cameraStartX.ToString(), "0 upwards");
+            if (cameraStartY < 0) throw new InvalidValueException("StartY", cameraStartY.ToString(), "0 upwards");
+            if (cameraStartX + cameraNumX > ccdWidth) throw new InvalidValueException("StartX + NumX", (cameraStartX + cameraNumX).ToString(), ccdWidth.ToString());
+            if (cameraStartY + cameraNumY > ccdHeight) throw new InvalidValueException("StartY + NumY", (cameraStartY + cameraNumY).ToString(), ccdHeight.ToString());
+        }
+
+        private static void ApplyRoi()
+        {
+            bool fullFrame = cameraStartX == 0 && cameraStartY == 0 && cameraNumX == ccdWidth && cameraNumY == ccdHeight;
+            if (fullFrame)
+            {
+                CheckStatus(DVPCamera.dvpSetRoiState(CameraHardware.handle, false), "dvpSetRoiState(false)");
+                return;
+            }
+
+            dvpRegion roi = new dvpRegion();
+            roi.X = cameraStartX;
+            roi.Y = cameraStartY;
+            roi.W = cameraNumX;
+            roi.H = cameraNumY;
+            CheckStatus(DVPCamera.dvpSetRoi(CameraHardware.handle, roi), "dvpSetRoi");
+            CheckStatus(DVPCamera.dvpSetRoiState(CameraHardware.handle, true), "dvpSetRoiState(true)");
+        }
+
+        private static void ConfigureManualExposure(double duration)
+        {
+            ApplyRoi();
+            ConfigureExposureOnly(duration);
+        }
+
+        private static void ConfigureExposureOnly(double duration)
+        {
+            double exposureMicroseconds = QuantizeExposureMicroseconds(duration);
+            CheckStatus(DVPCamera.dvpSetAeOperation(CameraHardware.handle, dvpAeOperation.AE_OP_OFF), "dvpSetAeOperation(AE_OP_OFF)");
+            LogOptionalStatus(DVPCamera.dvpSetSoftTriggerLoopState(CameraHardware.handle, false), "dvpSetSoftTriggerLoopState(false)");
+            CheckStatus(DVPCamera.dvpSetExposure(CameraHardware.handle, exposureMicroseconds), "dvpSetExposure");
+
+            double actualExposure = 0.0;
+            dvpStatus exposureStatus = DVPCamera.dvpGetExposure(CameraHardware.handle, ref actualExposure);
+            if (exposureStatus == dvpStatus.DVP_STATUS_OK)
+            {
+                CameraHardware.LastDuration = actualExposure / 1000000.0;
+                LogMessage("StartExposure", $"Exposure requested {exposureMicroseconds}us, camera set {actualExposure}us");
+            }
+            else
+            {
+                CameraHardware.LastDuration = exposureMicroseconds / 1000000.0;
+                LogMessage("StartExposure", $"dvpGetExposure returned {exposureStatus}");
+            }
+        }
+
+        private static double QuantizeExposureMicroseconds(double duration)
+        {
+            const double stepMicroseconds = 41.0;
+            double requestedMicroseconds = duration * 1000000.0;
+            double steps = Math.Floor((requestedMicroseconds + 0.000001) / stepMicroseconds);
+            double quantizedMicroseconds = steps * stepMicroseconds;
+            double minimumMicroseconds = HardwareMinExposureDuration * 1000000.0;
+            double maximumMicroseconds = HardwareMaxExposureDuration * 1000000.0;
+            if (quantizedMicroseconds < minimumMicroseconds) quantizedMicroseconds = minimumMicroseconds;
+            if (quantizedMicroseconds > maximumMicroseconds) quantizedMicroseconds = maximumMicroseconds;
+            return quantizedMicroseconds;
+        }
+
+        private static void StartFreeRunStream()
+        {
+            CheckStatus(DVPCamera.dvpSetTriggerState(CameraHardware.handle, false), "dvpSetTriggerState(false)");
+            ConfigureFrameQueue();
+            dvpStatus startStatus = DVPCamera.dvpStart(CameraHardware.handle);
+            if (!IsStreamStartAccepted(startStatus))
+            {
+                CheckStatus(startStatus, "dvpStart");
+            }
+            if (startStatus != dvpStatus.DVP_STATUS_OK)
+            {
+                LogMessage("dvpStart", $"Accepted status {startStatus}; waiting for the first frame.");
+            }
+            captureStartupTimeoutPending = true;
+        }
+
+        private static bool IsStreamStartAccepted(dvpStatus status)
+        {
+            return status == dvpStatus.DVP_STATUS_OK ||
+                   status == dvpStatus.DVP_STATUS_IN_PROCESS ||
+                   status == dvpStatus.DVP_STATUS_DEVICE_IS_STARTED ||
+                   status == dvpStatus.DVP_STATUS_NOT_STOPPED;
+        }
+
+        private static void ConfigureAnalogGain(short gain)
+        {
+            float analogGain = (float)(gain / AnalogGainScale);
+            CheckStatus(DVPCamera.dvpSetAnalogGain(CameraHardware.handle, analogGain), $"dvpSetAnalogGain({gain})");
+        }
+
+        private static void StartCaptureThread()
+        {
+            if (captureThread != null && captureThread.IsAlive)
+            {
+                throw new DriverException("Refusing to start a second DVP capture thread while the previous thread is still running.");
+            }
+
+            captureThreadStop = false;
+            captureThread = new System.Threading.Thread(CaptureLoop);
+            captureThread.IsBackground = true;
+            captureThread.Name = "DVP single-frame capture";
+            captureThread.Start();
+        }
+
+        private static void CaptureLoop()
+        {
+            int recoveryStage = 0;
+            int fullReopenAttempts = 0;
+            try
+            {
+                while (!captureThreadStop)
+                {
+                    ApplyPendingExposureOnCaptureThread();
+                    ApplyPendingGainOnCaptureThread();
+                    if (captureThreadStop) break;
+
+                    dvpStatus status = CaptureNextFrame();
+                    if (status == dvpStatus.DVP_STATUS_OK)
+                    {
+                        if (captureRecoveryInProgress)
+                        {
+                            LogMessage("Capture", $"Recovery confirmed by a real frame after recovery stage {recoveryStage}.");
+                        }
+                        recoveryStage = 0;
+                        fullReopenAttempts = 0;
+                        captureRecoveryInProgress = false;
+                        lock (cameraLock) captureFailureMessage = string.Empty;
+                        continue;
+                    }
+
+                    if (captureThreadStop) break;
+                    captureRecoveryInProgress = true;
+                    LogMessage("Capture", $"dvpGetFrame returned {status}; recovery stage {recoveryStage}.");
+                    lock (cameraLock)
+                    {
+                        if (cameraState == CameraStates.cameraExposing && capturedFrameAvailable && IsCapturedFrameFreshLocked(requestedCaptureDuration) && ExposureDurationsMatch(configuredCaptureRequestDuration, requestedCaptureDuration) && capturedFrameGain == requestedGain && appliedGain == requestedGain)
+                        {
+                            LogMessage("Capture", "Publishing the most recent valid single frame after a capture error.");
+                            PublishCapturedFrameLocked(requestedCaptureDuration, true);
+                        }
+                    }
+
+                    bool reopened = false;
+                    while (!captureThreadStop && fullReopenAttempts < MaximumFullReopenAttempts && !reopened)
+                    {
+                        fullReopenAttempts++;
+                        LogMessage("Capture", $"Full camera reopen attempt {fullReopenAttempts}/{MaximumFullReopenAttempts}.");
+                        reopened = TryReopenCameraOnCaptureThread();
+                        if (!reopened && !captureThreadStop)
+                        {
+                            System.Threading.Thread.Sleep(RecoveryRetryDelayMilliseconds);
+                        }
+                    }
+
+                    if (reopened)
+                    {
+                        recoveryStage = 2;
+                        continue;
+                    }
+
+                    if (captureThreadStop) break;
+                    throw new DriverException($"Camera produced no frame after the permitted device reopen attempts. Last SDK status: {status}.");
+                }
+            }
+            catch (Exception ex)
+            {
+                captureRecoveryInProgress = false;
+                LogMessage("Capture", $"Capture thread stopped by exception: {ex}");
+                // Ensure an asynchronously-starting SDK stream cannot poison the next exposure
+                // with DVP_STATUS_IN_PROCESS after this worker exits.
+                if (IsValidHandle(CameraHardware.handle))
+                {
+                    try
+                    {
+                        dvpStatus stopStatus = DVPCamera.dvpStop(CameraHardware.handle);
+                        LogMessage("Capture", $"Failure cleanup dvpStop returned {stopStatus}.");
+                    }
+                    catch (Exception stopException)
+                    {
+                        LogMessage("Capture", $"Failure cleanup dvpStop threw: {stopException.Message}");
+                    }
+                }
+                lock (cameraLock)
+                {
+                    captureFailureMessage = ex.Message;
+                    cameraImageReady = false;
+                    cameraImageDownloaded = false;
+                    cameraState = CameraStates.cameraError;
+                }
+            }
+            finally
+            {
+                captureRecoveryInProgress = false;
+                lock (cameraLock)
+                {
+                    if (captureThread == System.Threading.Thread.CurrentThread)
+                    {
+                        captureThread = null;
+                    }
+                    System.Threading.Monitor.PulseAll(cameraLock);
+                }
+            }
+        }
+
+        private static void ApplyPendingExposureOnCaptureThread()
+        {
+            double desiredDuration;
+            lock (cameraLock)
+            {
+                desiredDuration = requestedCaptureDuration;
+                if (ExposureDurationsMatch(configuredCaptureRequestDuration, desiredDuration)) return;
+            }
+
+            ConfigureExposureOnly(desiredDuration);
+            lock (cameraLock)
+            {
+                configuredCaptureRequestDuration = desiredDuration;
+                appliedCaptureDuration = CameraHardware.LastDuration;
+                ResetCapturedFrame();
+                LogMessage("Capture", $"Applied queued exposure change: requested {desiredDuration}s, actual {appliedCaptureDuration}s.");
+            }
+        }
+
+        private static void ApplyPendingGainOnCaptureThread()
+        {
+            short desiredGain;
+            lock (cameraLock)
+            {
+                desiredGain = requestedGain;
+                if (appliedGain == desiredGain) return;
+            }
+
+            ConfigureAnalogGain(desiredGain);
+            lock (cameraLock)
+            {
+                appliedGain = desiredGain;
+                InvalidateCapturedFrameCacheLocked();
+                LogMessage("Capture", $"Applied queued gain change: {desiredGain} (analog {desiredGain / AnalogGainScale:F4}).");
+            }
+        }
+
+        private static bool TryReopenCameraOnCaptureThread()
+        {
+            LogMessage("Capture", "Attempting one full camera close/open recovery.");
+            try
+            {
+                if (captureThreadStop) return false;
+                try { DVPCamera.dvpStop(CameraHardware.handle); } catch { }
+                dvpStatus closeStatus = DVPCamera.dvpClose(CameraHardware.handle);
+                LogMessage("Capture", $"Recovery dvpClose returned {closeStatus}.");
+                CameraHardware.handle = 0;
+                lock (cameraLock)
+                {
+                    appliedGain = 0;
+                    capturedFrameAvailable = false;
+                    capturedFrameGain = 0;
+                }
+                // The camera frequently needed a second reopen because one second was not enough
+                // for its USB/SDK session to settle. Spending one extra second here is preferable
+                // to another pair of ten-second startup frame waits.
+                System.Threading.Thread.Sleep(2000);
+                if (captureThreadStop) return false;
+
+                CameraHardware.handle = OpenPreferredCamera("capture-thread recovery");
+                bool online = false;
+                CheckStatus(DVPCamera.dvpIsOnline(CameraHardware.handle, ref online), "dvpIsOnline during recovery");
+                if (!online) throw new NotConnectedException("The reopened DVP camera is not online.");
+
+                double desiredDuration;
+                short desiredGain;
+                lock (cameraLock)
+                {
+                    desiredDuration = requestedCaptureDuration;
+                    desiredGain = requestedGain;
+                }
+                ConfigureManualExposure(desiredDuration);
+                ConfigureAnalogGain(desiredGain);
+                StartFreeRunStream();
+
+                lock (cameraLock)
+                {
+                    configuredCaptureRequestDuration = desiredDuration;
+                    appliedCaptureDuration = CameraHardware.LastDuration;
+                    appliedGain = desiredGain;
+                    ResetCapturedFrame();
+                    captureSignature = BuildCaptureSignature();
+                    captureFailureMessage = string.Empty;
+                }
+                LogMessage("Capture", "Full camera close/open cycle completed; recovery remains pending until a real frame is received.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogMessage("Capture", $"Full camera close/open recovery failed: {ex}");
+                try { DVPCamera.dvpStop(CameraHardware.handle); } catch { }
+                try { DVPCamera.dvpClose(CameraHardware.handle); } catch { }
+                CameraHardware.handle = 0;
+                appliedGain = 0;
+                lock (cameraLock) captureFailureMessage = ex.Message;
+                return false;
+            }
+        }
+
+        private static dvpStatus CaptureNextFrame()
+        {
+            double activeDuration;
+            bool startupTimeout;
+            lock (cameraLock)
+            {
+                activeDuration = appliedCaptureDuration;
+                startupTimeout = captureStartupTimeoutPending;
+            }
+            uint timeout = startupTimeout
+                ? CalculateStartupFrameTimeout(activeDuration)
+                : CalculateFrameTimeout(activeDuration);
+
+            // This SDK/camera combination reproducibly needs a second dvpGetFrame call after
+            // dvpStart: the first startup call may time out even though the second immediately
+            // begins receiving frames. Once a real frame has arrived, use only one uninterrupted
+            // wait so long exposures are not split into timeout/restart cycles.
+            for (int frameAttempt = 1; frameAttempt <= 2 && !captureThreadStop; frameAttempt++)
+            {
+                dvpFrame refRaw = new dvpFrame();
+                IntPtr rawPtr = IntPtr.Zero;
+                dvpStatus frameStatus = DVPCamera.dvpGetFrame(CameraHardware.handle, ref refRaw, ref rawPtr, timeout);
+                if (frameStatus != dvpStatus.DVP_STATUS_OK)
+                {
+                    if (startupTimeout &&
+                        frameStatus == dvpStatus.DVP_STATUS_TIME_OUT &&
+                        frameAttempt == 1 &&
+                        !captureThreadStop)
+                    {
+                        LogMessage("Capture", "First startup dvpGetFrame timed out; issuing the camera-required second startup call.");
+                        continue;
+                    }
+                    return frameStatus;
+                }
+
+                lock (cameraLock)
+                {
+                    if (captureThreadStop) return dvpStatus.DVP_STATUS_OK;
+                    captureStartupTimeoutPending = false;
+
+                    ValidateFrame(refRaw, rawPtr);
+
+                    double actualDuration = refRaw.fExposure > 0 ? refRaw.fExposure / 1000000.0 : 0.0;
+                    if (actualDuration > 0 && activeDuration > 0 && actualDuration < activeDuration * 0.8)
+                    {
+                        LogMessage("Capture", $"Discarding short frame: active exposure {activeDuration}s, frame reports {actualDuration}s");
+                        if (frameAttempt < 2) continue;
+                        return dvpStatus.DVP_STATUS_TIME_OUT;
+                    }
+                    StoreCapturedFrame(refRaw, rawPtr, actualDuration > 0 ? actualDuration : activeDuration);
+                    System.Threading.Monitor.PulseAll(cameraLock);
+                    return dvpStatus.DVP_STATUS_OK;
+                }
+            }
+
+            return captureThreadStop ? dvpStatus.DVP_STATUS_OK : dvpStatus.DVP_STATUS_TIME_OUT;
+        }
+        private static void StoreCapturedFrame(dvpFrame frame, IntPtr rawPtr, double duration)
+        {
+            EnsureImageArray();
+            CopyFrameToImageArray(frame, rawPtr, captureImageArray, duration);
+            capturedFrameAvailable = true;
+            capturedFrameDuration = duration;
+            capturedFrameStartTime = DateTime.UtcNow - TimeSpan.FromSeconds(duration > 0 ? duration : 0.0);
+            capturedFrameArrivalTime = DateTime.UtcNow;
+            capturedFrameGain = appliedGain;
+            capturedFrameVersion++;
+            captureFailureMessage = string.Empty;
+            if (cameraState == CameraStates.cameraExposing && capturedFrameVersion > deliveredFrameVersion && ExposureDurationsMatch(configuredCaptureRequestDuration, requestedCaptureDuration) && capturedFrameGain == requestedGain && appliedGain == requestedGain)
+            {
+                PublishCapturedFrameLocked(requestedCaptureDuration, true);
+            }
+        }
+
+        private static void PublishCapturedFrameLocked(double requestedDuration, bool light)
+        {
+            int[,] previousPublishedImage = cameraImageArray;
+            cameraImageArray = captureImageArray;
+            captureImageArray = previousPublishedImage;
+            cameraLastExposureDuration = capturedFrameDuration > 0 ? capturedFrameDuration : appliedCaptureDuration;
+            exposureStart = capturedFrameStartTime != DateTime.MinValue ? capturedFrameStartTime : DateTime.UtcNow;
+            deliveredFrameVersion = capturedFrameVersion;
+            capturedFrameAvailable = false;
+            cameraImageReady = true;
+            cameraImageDownloaded = true;
+            cameraImageArrayVariant = null;
+            cameraState = CameraStates.cameraIdle;
+            LogMessage("StartExposure", $"Duration {requestedDuration}, Light {light}, delivered single frame, actual exposure {cameraLastExposureDuration}s, version {deliveredFrameVersion}.");
+        }
+
+        private static void ConfigureFrameQueue()
+        {
+            dvpBufferConfig bufferConfig = new dvpBufferConfig();
+            dvpStatus getStatus = DVPCamera.dvpGetBufferConfig(CameraHardware.handle, ref bufferConfig);
+            if (getStatus == dvpStatus.DVP_STATUS_OK)
+            {
+                bufferConfig.mode = dvpBufferMode.BUFFER_MODE_NEWEST;
+                bufferConfig.uQueueSize = SdkFrameQueueSize;
+                bufferConfig.bDropNew = false;
+                bufferConfig.bLite = true;
+                LogOptionalStatus(DVPCamera.dvpSetBufferConfig(CameraHardware.handle, bufferConfig), "dvpSetBufferConfig(NEWEST)");
+            }
+            else
+            {
+                LogMessage("dvpGetBufferConfig", $"Optional SDK call returned {getStatus}");
+                LogOptionalStatus(DVPCamera.dvpSetBufferQueueSize(CameraHardware.handle, SdkFrameQueueSize), $"dvpSetBufferQueueSize({SdkFrameQueueSize})");
+            }
+        }
+
+        private static string BuildCaptureSignature()
+        {
+            return $"{cameraStartX}|{cameraStartY}|{cameraNumX}|{cameraNumY}";
+        }
+
+        private static bool ExposureDurationsMatch(double first, double second)
+        {
+            double scale = Math.Max(Math.Abs(first), Math.Abs(second));
+            double tolerance = Math.Max(0.000001, scale * 0.01);
+            return Math.Abs(first - second) <= tolerance;
+        }
+
+        private static bool IsCapturedFrameFreshLocked(double duration)
+        {
+            if (!capturedFrameAvailable || capturedFrameArrivalTime == DateTime.MinValue) return false;
+            double maximumAgeSeconds = Math.Max(5.0, duration + FrameReadoutMarginMilliseconds / 1000.0);
+            double ageSeconds = (DateTime.UtcNow - capturedFrameArrivalTime).TotalSeconds;
+            return ageSeconds >= 0.0 && ageSeconds <= maximumAgeSeconds;
+        }
+
+        private static void EnsureImageArray()
+        {
+            if (cameraImageArray == null || cameraImageArray.GetLength(0) != cameraNumX || cameraImageArray.GetLength(1) != cameraNumY)
+            {
+                cameraImageArray = new int[cameraNumX, cameraNumY];
+                captureImageArray = new int[cameraNumX, cameraNumY];
+            }
+            else if (captureImageArray == null || captureImageArray.GetLength(0) != cameraNumX || captureImageArray.GetLength(1) != cameraNumY)
+            {
+                captureImageArray = new int[cameraNumX, cameraNumY];
+            }
+        }
+
+        private static void ResetCapturedFrame()
+        {
+            InvalidateCapturedFrameCacheLocked();
+            capturedFrameVersion = 0;
+            deliveredFrameVersion = 0;
+            if (cameraImageArray != null)
+            {
+                Array.Clear(cameraImageArray, 0, cameraImageArray.Length);
+            }
+            if (captureImageArray != null)
+            {
+                Array.Clear(captureImageArray, 0, captureImageArray.Length);
+            }
+            cameraImageArrayVariant = null;
+        }
+
+        private static void InvalidateCapturedFrameCacheLocked()
+        {
+            capturedFrameAvailable = false;
+            capturedFrameDuration = 0.0;
+            capturedFrameStartTime = DateTime.MinValue;
+            capturedFrameArrivalTime = DateTime.MinValue;
+            capturedFrameGain = 0;
+        }
+
+        private static void ValidateFrame(dvpFrame frame, IntPtr buffer)
+        {
+            if (buffer == IntPtr.Zero)
+            {
+                throw new DriverException("dvpGetFrame returned a null image buffer.");
+            }
+
+            if (frame.iWidth != cameraNumX || frame.iHeight != cameraNumY)
+            {
+                throw new DriverException($"Camera returned {frame.iWidth}x{frame.iHeight}, expected {cameraNumX}x{cameraNumY}.");
+            }
+        }
+        private static uint CalculateFrameTimeout(double duration)
+        {
+            // Free-run exposure changes can leave one old/in-progress frame in the sensor and the
+            // first matching frame may therefore arrive after nearly two exposure periods.
+            double timeout = Math.Ceiling(duration * 2000.0) + FrameReadoutMarginMilliseconds;
+            if (timeout < MinimumFrameTimeoutMilliseconds * 2.0) timeout = MinimumFrameTimeoutMilliseconds * 2.0;
+            if (timeout > uint.MaxValue) timeout = uint.MaxValue;
+            return (uint)timeout;
+        }
+
+        private static uint CalculateStartupFrameTimeout(double duration)
+        {
+            double timeout = Math.Ceiling(duration * 2000.0) + FrameReadoutMarginMilliseconds;
+            // Keep the known-good two-call startup behavior. For short exposures this gives the
+            // SDK two ten-second startup calls rather than one twenty-second call, which the
+            // July 27 logs proved never produced a frame.
+            if (timeout < 10000.0) timeout = 10000.0;
+            if (timeout > uint.MaxValue) timeout = uint.MaxValue;
+            return (uint)timeout;
+        }
+
+        private static void StopStreamIfStarted()
+        {
+            captureThreadStop = true;
+            System.Threading.Thread thread = captureThread;
+
+            // Local flags can be stale after a capture-thread failure while the SDK still reports
+            // DVP_STATUS_IN_PROCESS. An idempotent stop on every valid handle makes restart safe.
+            if (IsValidHandle(CameraHardware.handle))
+            {
+                dvpStatus stopStatus = DVPCamera.dvpStop(CameraHardware.handle);
+                if (stopStatus != dvpStatus.DVP_STATUS_OK && stopStatus != dvpStatus.DVP_STATUS_NOT_STARTED && stopStatus != dvpStatus.DVP_STATUS_DEVICE_IS_STOPPED)
+                {
+                    LogMessage("StopStream", $"dvpStop returned {stopStatus}");
+                }
+            }
+
+            if (thread != null && thread.IsAlive && thread != System.Threading.Thread.CurrentThread)
+            {
+                int joinTimeout = (int)Math.Min(45000.0, Math.Max(5000.0, appliedCaptureDuration * 1000.0 + 5000.0));
+                if (!thread.Join(joinTimeout))
+                {
+                    LogMessage("StopStream", $"Capture thread did not stop within {joinTimeout}ms; refusing to discard its reference or start a second SDK reader.");
+                    throw new DriverException("The DVP capture thread did not stop cleanly. A second capture thread was not started to protect camera stability.");
+                }
+            }
+
+            lock (cameraLock)
+            {
+                if (captureThread == thread && (thread == null || !thread.IsAlive))
+                {
+                    captureThread = null;
+                }
+                captureRecoveryInProgress = false;
+            }
+        }
+        private static void EnsureImageDownloaded()
+        {
+            if (!cameraImageReady)
+            {
+                LogMessage("ImageArray Get", "Throwing InvalidOperationException because of a call to ImageArray before the first image has been taken!");
+                throw new ASCOM.InvalidOperationException("Call to ImageArray before the first image has been taken!");
+            }
+
+            if (cameraImageDownloaded && cameraImageArray != null)
+            {
+                return;
+            }
+
+            CheckConnected("ImageArray");
+            if (!cameraImageDownloaded || cameraImageArray == null)
+            {
+                throw new DriverException("No downloaded image is available from the last exposure.");
+            }
+        }
+
+        private static void CopyFrameToImageArray(dvpFrame frame, IntPtr buffer, int[,] image, double exposureDuration)
+        {
+            int width = frame.iWidth;
+            int height = frame.iHeight;
+            int pixelCount = checked(width * height);
+
+            if (frame.bits == dvpBits.BITS_8)
+            {
+                uint requiredBytes = checked((uint)pixelCount);
+                if (frame.uBytes < requiredBytes) throw new DriverException($"Frame buffer is too small for an 8-bit image: {frame.uBytes} bytes.");
+
+                if (frameCopyBuffer8 == null || frameCopyBuffer8.Length != pixelCount) frameCopyBuffer8 = new byte[pixelCount];
+                Marshal.Copy(buffer, frameCopyBuffer8, 0, pixelCount);
+                Copy8BitFrame(frameCopyBuffer8, image, width, height);
+                return;
+            }
+
+            if (frame.bits == dvpBits.BITS_10 || frame.bits == dvpBits.BITS_12 || frame.bits == dvpBits.BITS_14 || frame.bits == dvpBits.BITS_16)
+            {
+                uint requiredBytes = checked((uint)(pixelCount * 2));
+                if (frame.uBytes < requiredBytes) throw new DriverException($"Packed {frame.bits} frames are not supported by this driver path.");
+
+                if (frameCopyBuffer16 == null || frameCopyBuffer16.Length != pixelCount) frameCopyBuffer16 = new short[pixelCount];
+                Marshal.Copy(buffer, frameCopyBuffer16, 0, pixelCount);
+                Copy16BitFrame(frameCopyBuffer16, image, width, height, exposureDuration);
+                return;
+            }
+
+            throw new DriverException($"Unsupported image bit depth: {frame.bits}");
+        }
+        private static void Copy8BitFrame(byte[] pixels, int[,] image, int width, int height)
+        {
+            if (width * height >= 1000000)
+            {
+                System.Threading.Tasks.Parallel.For(0, height, y =>
+                {
+                    int source = y * width;
+                    for (int x = 0; x < width; x++)
+                    {
+                        image[x, y] = pixels[source + x];
+                    }
+                });
+                return;
+            }
+
+            for (int y = 0; y < height; y++)
+            {
+                int source = y * width;
+                for (int x = 0; x < width; x++)
+                {
+                    image[x, y] = pixels[source + x];
+                }
+            }
+        }
+
+        private static void Copy16BitFrame(short[] pixels, int[,] image, int width, int height, double exposureDuration)
+        {
+            DaytimeSmoothCorrection.Result correction = DaytimeSmoothCorrection.Estimate(
+                pixels,
+                width,
+                height,
+                cameraStartX,
+                cameraStartY,
+                exposureDuration);
+
+            if (correction.Applied)
+            {
+                LogMessage(
+                    "DaytimeSmooth",
+                    $"Applied G2={correction.Slope:F6}*G1+{correction.Intercept:F2}, r={correction.Correlation:F6}, samples={correction.Samples}, exposure={exposureDuration:F6}s.");
+            }
+            else if (DaytimeSmoothCorrection.Enabled && exposureDuration <= DaytimeSmoothCorrection.MaximumExposureSeconds)
+            {
+                LogMessage(
+                    "DaytimeSmooth",
+                    $"Skipped correction: {correction.Reason}; slope={correction.Slope:F6}, r={correction.Correlation:F6}, samples={correction.Samples}.");
+            }
+
+            if (width * height >= 1000000)
+            {
+                System.Threading.Tasks.Parallel.For(0, height, y =>
+                {
+                    int source = y * width;
+                    for (int x = 0; x < width; x++)
+                    {
+                        ushort value = unchecked((ushort)pixels[source + x]);
+                        image[x, y] = DaytimeSmoothCorrection.CorrectPixel(
+                            value,
+                            x,
+                            y,
+                            cameraStartX,
+                            cameraStartY,
+                            correction);
+                    }
+                });
+                return;
+            }
+
+            for (int y = 0; y < height; y++)
+            {
+                int source = y * width;
+                for (int x = 0; x < width; x++)
+                {
+                    ushort value = unchecked((ushort)pixels[source + x]);
+                    image[x, y] = DaytimeSmoothCorrection.CorrectPixel(
+                        value,
+                        x,
+                        y,
+                        cameraStartX,
+                        cameraStartY,
+                        correction);
+                }
+            }
+        }
         public static bool IsValidHandle(uint handle)
         {
             bool bValidHandle = false;
@@ -1389,6 +2395,7 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
                 driverProfile.DeviceType = "Camera";
                 tl.Enabled = Convert.ToBoolean(driverProfile.GetValue(DriverProgId, traceStateProfileName, string.Empty, traceStateDefault));
                 comPort = driverProfile.GetValue(DriverProgId, comPortProfileName, string.Empty, comPortDefault);
+                DaytimeSmoothCorrection.ReadProfile(driverProfile, DriverProgId);
             }
         }
 
@@ -1402,6 +2409,7 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
                 driverProfile.DeviceType = "Camera";
                 driverProfile.WriteValue(DriverProgId, traceStateProfileName, tl.Enabled.ToString());
                 driverProfile.WriteValue(DriverProgId, comPortProfileName, comPort.ToString());
+                DaytimeSmoothCorrection.WriteProfile(driverProfile, DriverProgId);
             }
         }
 
@@ -1429,4 +2437,3 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         #endregion
     }
 }
-

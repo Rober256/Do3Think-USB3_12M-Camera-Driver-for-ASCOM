@@ -368,15 +368,15 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
 
                     if (value)
                     {
-                        connectedState = true;
                         LogMessage("Connected Set", "Connecting to device");
                         CameraHardware.Connected = true;
+                        connectedState = true;
                     }
                     else
                     {
-                        connectedState = false;
                         LogMessage("Connected Set", "Disconnecting from device");
                         CameraHardware.Connected = false;
+                        connectedState = false;
                     }
                 }
                 catch (Exception ex)
@@ -1144,11 +1144,11 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             }
             set
             {
-                LogMessage("Gain Set", value.ToString());
-                CameraHardware.Gain = value;
                 try
                 {
                     CheckConnected("Gain Set");
+                    LogMessage("Gain Set", value.ToString());
+                    CameraHardware.Gain = value;
                 }
                 catch (Exception ex)
                 {
@@ -1543,11 +1543,11 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             }
             set
             {
-                LogMessage("NumY Set", value.ToString());
-                CameraHardware.NumY = value;
                 try
                 {
                     CheckConnected("NumY Set");
+                    LogMessage("NumY Set", value.ToString());
+                    CameraHardware.NumY = value;
                 }
                 catch (Exception ex)
                 {

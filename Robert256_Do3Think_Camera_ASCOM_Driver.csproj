@@ -80,6 +80,7 @@
     <Compile Include="ClassFactory.cs" />
     <Compile Include="CameraDriver\CameraDriver.cs" />
     <Compile Include="CameraDriver\CameraHardware..cs" />
+    <Compile Include="CameraDriver\DaytimeSmoothCorrection.cs" />
     <Compile Include="frmMain.cs">
       <SubType>Form</SubType>
     </Compile>

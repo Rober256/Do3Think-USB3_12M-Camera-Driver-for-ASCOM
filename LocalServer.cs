@@ -494,20 +494,20 @@ namespace ASCOM.LocalServer
                 Registry.ClassesRoot.DeleteSubKey($"CLSID\\{clsId}\\Programmable", false);
                 Registry.ClassesRoot.DeleteSubKey($"CLSID\\{clsId}", false);
 
-                // Uncomment the following lines to remove ASCOM Profile information when unregistering.
-                // Unregistering often occurs during version upgrades and, if the code below is enabled, will result in loss of all device configuration during the upgrade.
-                // For this reason, enabling this capability is not recommended.
-
-                //try
-                //{
-                //    TL.LogMessage("UnregisterObjects", $"Deleting ASCOM Profile registration for {driverType.Name} ({progId})");
-                //    using (var profile = new Profile())
-                //    {
-                //        profile.DeviceType = driverType.Name;
-                //        profile.Unregister(progId);
-                //    }
-                //}
-                //catch (Exception) { }
+                // Remove the ASCOM Profile entry so the driver no longer appears in the Chooser.
+                try
+                {
+                    TL.LogMessage("UnregisterObjects", $"Deleting ASCOM Profile registration for {driverType.Name} ({progId})");
+                    using (var profile = new Profile())
+                    {
+                        profile.DeviceType = driverType.Name;
+                        profile.Unregister(progId);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    TL.LogMessageCrLf("UnregisterObjects", $"ASCOM Profile unregistration exception: {ex}");
+                }
             }
         }
 

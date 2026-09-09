@@ -361,3 +361,8 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Local release and analysis artifacts
+/dist/
+/outputs/
+/work/process_night_fits.py

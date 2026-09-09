@@ -36,14 +36,18 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             this.label2 = new System.Windows.Forms.Label();
             this.chkTrace = new System.Windows.Forms.CheckBox();
             this.comboBoxComPort = new System.Windows.Forms.ComboBox();
+            this.chkDaytimeSmoothCorrection = new System.Windows.Forms.CheckBox();
+            this.label3 = new System.Windows.Forms.Label();
+            this.numericDaytimeMaximumExposureMs = new System.Windows.Forms.NumericUpDown();
             ((System.ComponentModel.ISupportInitialize)(this.picASCOM)).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)(this.numericDaytimeMaximumExposureMs)).BeginInit();
             this.SuspendLayout();
             // 
             // cmdOK
             // 
             this.cmdOK.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Right)));
             this.cmdOK.DialogResult = System.Windows.Forms.DialogResult.OK;
-            this.cmdOK.Location = new System.Drawing.Point(281, 112);
+            this.cmdOK.Location = new System.Drawing.Point(281, 170);
             this.cmdOK.Name = "cmdOK";
             this.cmdOK.Size = new System.Drawing.Size(59, 24);
             this.cmdOK.TabIndex = 0;
@@ -55,7 +59,7 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             // 
             this.cmdCancel.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Right)));
             this.cmdCancel.DialogResult = System.Windows.Forms.DialogResult.Cancel;
-            this.cmdCancel.Location = new System.Drawing.Point(281, 142);
+            this.cmdCancel.Location = new System.Drawing.Point(281, 200);
             this.cmdCancel.Name = "cmdCancel";
             this.cmdCancel.Size = new System.Drawing.Size(59, 25);
             this.cmdCancel.TabIndex = 1;
@@ -69,7 +73,7 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             this.label1.Name = "label1";
             this.label1.Size = new System.Drawing.Size(123, 31);
             this.label1.TabIndex = 2;
-            this.label1.Text = "Construct your driver\'s setup dialog here.";
+            this.label1.Text = "Do3Think camera settings";
             // 
             // picASCOM
             // 
@@ -97,7 +101,7 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             // chkTrace
             // 
             this.chkTrace.AutoSize = true;
-            this.chkTrace.Location = new System.Drawing.Point(77, 118);
+            this.chkTrace.Location = new System.Drawing.Point(13, 185);
             this.chkTrace.Name = "chkTrace";
             this.chkTrace.Size = new System.Drawing.Size(69, 17);
             this.chkTrace.TabIndex = 6;
@@ -111,12 +115,57 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             this.comboBoxComPort.Name = "comboBoxComPort";
             this.comboBoxComPort.Size = new System.Drawing.Size(133, 21);
             this.comboBoxComPort.TabIndex = 7;
-            // 
+            //
+            // chkDaytimeSmoothCorrection
+            //
+            this.chkDaytimeSmoothCorrection.AutoSize = true;
+            this.chkDaytimeSmoothCorrection.Location = new System.Drawing.Point(13, 121);
+            this.chkDaytimeSmoothCorrection.Name = "chkDaytimeSmoothCorrection";
+            this.chkDaytimeSmoothCorrection.Size = new System.Drawing.Size(157, 17);
+            this.chkDaytimeSmoothCorrection.TabIndex = 8;
+            this.chkDaytimeSmoothCorrection.Text = "Daytime Smooth correction";
+            this.chkDaytimeSmoothCorrection.UseVisualStyleBackColor = true;
+            //
+            // label3
+            //
+            this.label3.AutoSize = true;
+            this.label3.Location = new System.Drawing.Point(13, 153);
+            this.label3.Name = "label3";
+            this.label3.Size = new System.Drawing.Size(96, 13);
+            this.label3.TabIndex = 9;
+            this.label3.Text = "Max exposure (ms)";
+            //
+            // numericDaytimeMaximumExposureMs
+            //
+            this.numericDaytimeMaximumExposureMs.DecimalPlaces = 3;
+            this.numericDaytimeMaximumExposureMs.Location = new System.Drawing.Point(116, 150);
+            this.numericDaytimeMaximumExposureMs.Maximum = new decimal(new int[] {
+            1000,
+            0,
+            0,
+            0});
+            this.numericDaytimeMaximumExposureMs.Minimum = new decimal(new int[] {
+            41,
+            0,
+            0,
+            196608});
+            this.numericDaytimeMaximumExposureMs.Name = "numericDaytimeMaximumExposureMs";
+            this.numericDaytimeMaximumExposureMs.Size = new System.Drawing.Size(94, 20);
+            this.numericDaytimeMaximumExposureMs.TabIndex = 10;
+            this.numericDaytimeMaximumExposureMs.Value = new decimal(new int[] {
+            10,
+            0,
+            0,
+            0});
+            //
             // SetupDialogForm
-            // 
+            //
             this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(350, 175);
+            this.ClientSize = new System.Drawing.Size(350, 235);
+            this.Controls.Add(this.numericDaytimeMaximumExposureMs);
+            this.Controls.Add(this.label3);
+            this.Controls.Add(this.chkDaytimeSmoothCorrection);
             this.Controls.Add(this.comboBoxComPort);
             this.Controls.Add(this.chkTrace);
             this.Controls.Add(this.label2);
@@ -132,6 +181,7 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
             this.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen;
             this.Text = "RobertDo3Think_USB3_12M_Camera Setup";
             this.Load += new System.EventHandler(this.SetupDialogForm_Load);
+            ((System.ComponentModel.ISupportInitialize)(this.numericDaytimeMaximumExposureMs)).EndInit();
             ((System.ComponentModel.ISupportInitialize)(this.picASCOM)).EndInit();
             this.ResumeLayout(false);
             this.PerformLayout();
@@ -147,5 +197,8 @@ namespace ASCOM.RobertDo3Think_USB3_12M_Camera.Camera
         private System.Windows.Forms.Label label2;
         private System.Windows.Forms.CheckBox chkTrace;
         private System.Windows.Forms.ComboBox comboBoxComPort;
+        private System.Windows.Forms.CheckBox chkDaytimeSmoothCorrection;
+        private System.Windows.Forms.Label label3;
+        private System.Windows.Forms.NumericUpDown numericDaytimeMaximumExposureMs;
     }
 }
