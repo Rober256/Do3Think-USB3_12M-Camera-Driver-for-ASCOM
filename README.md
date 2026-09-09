@@ -97,6 +97,7 @@ camera.Dispose();
 当前已经实现实际相机控制、软件触发驱动、ROI、图像采集和安装脚本的版本位于：
 
 - [当前实现分支](https://github.com/Rober256/Do3Think-USB3_12M-Camera-Driver-for-ASCOM/tree/codex/software-trigger-driver)
+- [v1.1.1 保守兼容版](https://github.com/Rober256/Do3Think-USB3_12M-Camera-Driver-for-ASCOM/releases/tag/v1.1.1)：如果 v1.1.2 在特定 USB、曝光切换或重连场景下出现异常，可作为稳定回退包。
 - [v1.1.2 发布页](https://github.com/Rober256/Do3Think-USB3_12M-Camera-Driver-for-ASCOM/releases/tag/v1.1.2)
 
 当前实现分支使用的 ProgID 与本 `master` 分支不同，使用前请以对应分支中的 README 和发布包说明为准。
@@ -107,4 +108,3 @@ camera.Dispose();
 - `Camera.cs`：ASCOM Camera 驱动类。
 - `SetupDialogForm.cs`：驱动设置对话框。
 - `ReadMe.htm`：早期 ASCOM 模板说明文件。
-
